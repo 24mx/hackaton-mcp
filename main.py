@@ -1,9 +1,13 @@
 import os
 import asyncio
+import logging
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from jira_client import JiraClient
-from ranking import rank_users_by_task
+from datetime import datetime
+from ranking import rank_resolvers
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -14,6 +18,15 @@ jira = JiraClient(
     email=os.environ["JIRA_EMAIL"],
     api_token=os.environ["JIRA_API_TOKEN"],
 )
+
+SINCE_DAYS = 365      # recency window for "similar resolved" tickets
+RESOLVED_CAP = 200    # max resolved tickets to aggregate (newest first)
+TOP_N = 10            # candidates returned
+ASSIGNABLE_MAX = 1000 # cap for the assignable-users fetch
+OPEN_COUNT_CONCURRENCY = 8
+# Match the classification on this custom field (Pierce "Component") instead of the
+# standard Jira `component` field, which IIS tickets leave empty. Blank → standard field.
+COMPONENT_CF_ID = os.environ.get("COMPONENT_CF_ID", "11604")
 
 
 @mcp.tool()
@@ -47,39 +60,73 @@ async def rank_users_for_task(
     labels: list[str] = [],
 ) -> list[dict]:
     """
-    Given a Jira task, return a ranked list of project users best suited to handle it.
+    Rank active project members by who has actually resolved similar tickets.
 
-    Ranking weights:
-    - 45% specialization: how often user handled similar ticket types/components/labels
-    - 35% workload:       fewer open tickets = higher score
-    - 20% role:           role seniority in the project
+    "Similar" = resolved tickets sharing the task's component (components[0]).
+    Candidates are restricted to active, assignable users who resolved such a
+    ticket within the recency window. Ranking:
+    - expertise (70%): recency-weighted count of similar resolutions
+    - workload  (30%): fewer open tickets ranks higher (tie-break/load-balance)
+
+    Returns up to TOP_N candidates, best first. Returns [] when there is no
+    component to match, no matching resolved tickets, or no active resolvers
+    (the caller should then fall back to its own routing).
 
     Args:
-        project_key:  Jira project key, e.g. "PROJ"
-        task_summary: Description or summary of the task
-        issue_type:   Issue type name, e.g. "Bug", "Story", "Task"
-        components:   List of component names from the task
-        labels:       List of labels from the task
+        project_key:  Jira project key, e.g. "IIS"
+        task_summary: Description or summary of the task (currently unused by ranking)
+        issue_type:   Unused (kept for compatibility)
+        components:   components[0] is the classification matched against history
+        labels:       Unused (kept for compatibility)
     """
-    members = await jira.get_project_members(project_key)
+    component = components[0] if components else ""
+    if not component:
+        return []
 
-    async def enrich(member: dict) -> dict:
-        account_id = member["accountId"]
-        recent, open_count = await asyncio.gather(
-            jira.get_user_tickets(account_id, project_key, limit=20),
-            jira.get_user_open_ticket_count(account_id, project_key),
+    try:
+        active, resolved = await asyncio.gather(
+            jira.get_active_assignable_users(project_key, ASSIGNABLE_MAX),
+            jira.search_resolved_by_component(
+                project_key, component, SINCE_DAYS, RESOLVED_CAP, COMPONENT_CF_ID
+            ),
         )
-        return {**member, "recent_tickets": recent, "open_ticket_count": open_count}
 
-    enriched = await asyncio.gather(*[enrich(m) for m in members])
+        agg: dict[str, dict] = {}
+        for ticket in resolved:
+            account_id = ticket["assignee_id"]
+            if account_id not in active:
+                continue
+            entry = agg.setdefault(
+                account_id,
+                {
+                    "accountId": account_id,
+                    "displayName": active[account_id],
+                    "resolved_dates": [],
+                },
+            )
+            entry["resolved_dates"].append(ticket["resolved_at"])
 
-    return rank_users_by_task(
-        users=list(enriched),
-        issue_type=issue_type,
-        components=components,
-        labels=labels,
-        task_summary=task_summary,
+        if not agg:
+            return []
+
+        sem = asyncio.Semaphore(OPEN_COUNT_CONCURRENCY)
+
+        async def _open_count(account_id):
+            async with sem:
+                return await jira.get_user_open_ticket_count(account_id, project_key)
+
+        candidate_ids = list(agg.keys())
+        open_counts = await asyncio.gather(*[_open_count(aid) for aid in candidate_ids])
+        for account_id, open_count in zip(candidate_ids, open_counts):
+            agg[account_id]["open_ticket_count"] = open_count
+    except Exception:
+        logger.exception("rank_users_for_task failed for project %s / component %r", project_key, component)
+        return []
+
+    ranked = rank_resolvers(
+        list(agg.values()), reference_date=datetime.now().date()
     )
+    return ranked[:TOP_N]
 
 
 if __name__ == "__main__":

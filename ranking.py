@@ -1,107 +1,80 @@
-# Ranking weights — must sum to 1.0
-WEIGHT_SPECIALIZATION = 0.45
-WEIGHT_WORKLOAD = 0.35
-WEIGHT_ROLE = 0.20
+"""Rank active resolvers by recency-weighted similar-resolution volume + workload."""
+from datetime import date, datetime
 
-# Jira default role names → seniority weight (0.0–1.0)
-ROLE_WEIGHTS: dict[str, float] = {
-    "Administrator": 0.6,
-    "Project Lead": 1.0,
-    "atlassian-addons-project-access": 0.0,
-    "Member": 0.7,
-    "Developer": 0.9,
-    "Viewer": 0.2,
-    "Service Desk Team": 0.6,
-    "Service Desk Customer - Portal Access": 0.1,
-}
-DEFAULT_ROLE_WEIGHT = 0.5
+HALF_LIFE_DAYS = 180   # a resolution this old contributes half weight
+K = 2.0                # saturation constant: expertise = rw / (rw + K)
+W_EXPERTISE = 0.7
+W_WORKLOAD = 0.3
+assert abs(W_EXPERTISE + W_WORKLOAD - 1.0) < 1e-9, "expertise/workload weights must sum to 1.0"
 
 
-def _role_score(roles: list[str]) -> float:
-    if not roles:
-        return DEFAULT_ROLE_WEIGHT
-    return max(ROLE_WEIGHTS.get(r, DEFAULT_ROLE_WEIGHT) for r in roles)
+def _parse_date(value):
+    """Parse a Jira resolutiondate (ISO string / date / datetime) to a date, or None."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.fromisoformat(str(value)[:10]).date()
+    except ValueError:
+        return None
 
 
-def _specialization_score(
-    recent_tickets: list[dict],
-    issue_type: str,
-    components: list[str],
-    labels: list[str],
-) -> float:
-    """Score 0–1: how well user's history matches the incoming task."""
-    if not recent_tickets:
+def _recency_weight(resolved_date, reference_date) -> float:
+    """Exponential decay weight in (0,1]: 1.0 today, 0.5 at HALF_LIFE_DAYS old."""
+    if resolved_date is None:
         return 0.0
-
-    criteria_count = sum([bool(issue_type), bool(components), bool(labels)])
-    if criteria_count == 0:
-        return 0.0
-
-    total_match = 0.0
-    for ticket in recent_tickets:
-        match = 0
-        if issue_type and ticket.get("type", "").lower() == issue_type.lower():
-            match += 1
-        if components:
-            ticket_comps = {c.lower() for c in ticket.get("components", [])}
-            if any(c.lower() in ticket_comps for c in components):
-                match += 1
-        if labels:
-            ticket_labels = {l.lower() for l in ticket.get("labels", [])}
-            if any(l.lower() in ticket_labels for l in labels):
-                match += 1
-        total_match += match / criteria_count
-
-    return total_match / len(recent_tickets)
+    age_days = max(0, (reference_date - resolved_date).days)
+    return 0.5 ** (age_days / HALF_LIFE_DAYS)
 
 
-def _workload_score(open_ticket_count: int) -> float:
+def _workload_score(open_ticket_count) -> float:
     """Inverse score — 0 open tickets → 1.0, grows heavier as tickets pile up."""
     return 1.0 / (1.0 + open_ticket_count * 0.25)
 
 
-def rank_users_by_task(
-    users: list[dict],
-    issue_type: str,
-    components: list[str],
-    labels: list[str],
-    task_summary: str,
-) -> list[dict]:
+def rank_resolvers(candidates, reference_date):
+    """Rank candidates who resolved similar tickets.
+
+    candidates: [{accountId, displayName, resolved_dates: [iso_str|date,...],
+                  open_ticket_count}]
+    reference_date: a datetime.date used for recency decay.
+    Returns a list sorted best-first with rank, score, and breakdown.
+    """
     ranked = []
-    for user in users:
-        spec = _specialization_score(
-            user.get("recent_tickets", []),
-            issue_type,
-            components,
-            labels,
-        )
-        workload = _workload_score(user.get("open_ticket_count", 0))
-        role = _role_score(user.get("roles", []))
-
-        score = (
-            WEIGHT_SPECIALIZATION * spec
-            + WEIGHT_WORKLOAD * workload
-            + WEIGHT_ROLE * role
-        )
-
+    for c in candidates:
+        dates = [d for d in (_parse_date(x) for x in c.get("resolved_dates", [])) if d]
+        rw = sum(_recency_weight(d, reference_date) for d in dates)
+        expertise = rw / (rw + K) if rw > 0 else 0.0
+        workload = _workload_score(c.get("open_ticket_count", 0))
+        score = W_EXPERTISE * expertise + W_WORKLOAD * workload
+        last_resolved = max(dates).isoformat() if dates else None
         ranked.append(
             {
-                "rank": 0,  # filled below
-                "accountId": user["accountId"],
-                "displayName": user["displayName"],
-                "roles": user.get("roles", []),
-                "open_tickets": user.get("open_ticket_count", 0),
+                "rank": 0,
+                "accountId": c["accountId"],
+                "displayName": c["displayName"],
                 "score": round(score, 4),
+                "similar_resolved_count": len(dates),
+                "last_resolved": last_resolved,
                 "score_breakdown": {
-                    "specialization": round(spec, 4),
+                    "expertise": round(expertise, 4),
                     "workload": round(workload, 4),
-                    "role": round(role, 4),
                 },
             }
         )
 
-    ranked.sort(key=lambda x: x["score"], reverse=True)
+    # all sort keys: higher/later = better, hence reverse=True
+    ranked.sort(
+        key=lambda x: (
+            x["score"],
+            x["similar_resolved_count"],
+            x["last_resolved"] or "",
+        ),
+        reverse=True,
+    )
     for i, entry in enumerate(ranked, start=1):
         entry["rank"] = i
-
     return ranked

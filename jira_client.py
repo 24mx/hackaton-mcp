@@ -83,6 +83,70 @@ class JiraClient:
         )
         return result.total
 
+    async def get_active_assignable_users(
+        self, project_key: str, max_results: int = 1000
+    ) -> dict[str, str]:
+        """Return {accountId: displayName} for active users assignable in the project."""
+        return await asyncio.to_thread(
+            self._active_assignable, project_key, max_results
+        )
+
+    def _active_assignable(self, project_key: str, max_results: int) -> dict[str, str]:
+        users = self._jira.search_assignable_users_for_projects(
+            "", project_key, maxResults=max_results
+        )
+        return {
+            u.accountId: u.displayName
+            for u in users
+            if getattr(u, "active", True)
+        }
+
+    async def search_resolved_by_component(
+        self, project_key: str, component: str, since_days: int, max_results: int,
+        component_cf_id: str = "",
+    ) -> list[dict]:
+        """Resolved tickets matching a component within the recency window, newest first.
+
+        component_cf_id: when set, match the custom field `cf[<id>]` (e.g. Pierce's
+        Component custom field) instead of the standard `component` field.
+        """
+        return await asyncio.to_thread(
+            self._resolved_by_component,
+            project_key, component, since_days, max_results, component_cf_id,
+        )
+
+    def _resolved_by_component(
+        self, project_key: str, component: str, since_days: int, max_results: int,
+        component_cf_id: str,
+    ) -> list[dict]:
+        safe_component = component.replace("\\", "\\\\").replace('"', '\\"')
+        if component_cf_id:
+            field_clause = f'cf[{int(component_cf_id)}] = "{safe_component}"'
+        else:
+            field_clause = f'component = "{safe_component}"'
+        jql = (
+            f'project = "{project_key}" AND {field_clause} '
+            f"AND statusCategory = Done AND resolved >= -{int(since_days)}d "
+            f"ORDER BY resolved DESC"
+        )
+        issues = self._jira.search_issues(
+            jql, maxResults=max_results, fields=["assignee", "resolutiondate"]
+        )
+        out = []
+        for issue in issues:
+            assignee = issue.fields.assignee
+            if assignee is None:
+                continue
+            out.append(
+                {
+                    "key": issue.key,
+                    "assignee_id": assignee.accountId,
+                    "assignee_name": assignee.displayName,
+                    "resolved_at": issue.fields.resolutiondate,
+                }
+            )
+        return out
+
     async def get_roles_with_members(self, project_key: str) -> dict:
         return await asyncio.to_thread(self._get_members_via_roles_dict, project_key)
 
