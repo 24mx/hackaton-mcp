@@ -24,6 +24,9 @@ RESOLVED_CAP = 200    # max resolved tickets to aggregate (newest first)
 TOP_N = 10            # candidates returned
 ASSIGNABLE_MAX = 1000 # cap for the assignable-users fetch
 OPEN_COUNT_CONCURRENCY = 8
+# Match the classification on this custom field (Pierce "Component") instead of the
+# standard Jira `component` field, which IIS tickets leave empty. Blank → standard field.
+COMPONENT_CF_ID = os.environ.get("COMPONENT_CF_ID", "11604")
 
 
 @mcp.tool()
@@ -84,7 +87,7 @@ async def rank_users_for_task(
         active, resolved = await asyncio.gather(
             jira.get_active_assignable_users(project_key, ASSIGNABLE_MAX),
             jira.search_resolved_by_component(
-                project_key, component, SINCE_DAYS, RESOLVED_CAP
+                project_key, component, SINCE_DAYS, RESOLVED_CAP, COMPONENT_CF_ID
             ),
         )
 

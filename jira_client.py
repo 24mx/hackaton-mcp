@@ -102,19 +102,30 @@ class JiraClient:
         }
 
     async def search_resolved_by_component(
-        self, project_key: str, component: str, since_days: int, max_results: int
+        self, project_key: str, component: str, since_days: int, max_results: int,
+        component_cf_id: str = "",
     ) -> list[dict]:
-        """Resolved tickets matching a component within the recency window, newest first."""
+        """Resolved tickets matching a component within the recency window, newest first.
+
+        component_cf_id: when set, match the custom field `cf[<id>]` (e.g. Pierce's
+        Component custom field) instead of the standard `component` field.
+        """
         return await asyncio.to_thread(
-            self._resolved_by_component, project_key, component, since_days, max_results
+            self._resolved_by_component,
+            project_key, component, since_days, max_results, component_cf_id,
         )
 
     def _resolved_by_component(
-        self, project_key: str, component: str, since_days: int, max_results: int
+        self, project_key: str, component: str, since_days: int, max_results: int,
+        component_cf_id: str,
     ) -> list[dict]:
         safe_component = component.replace("\\", "\\\\").replace('"', '\\"')
+        if component_cf_id:
+            field_clause = f'cf[{int(component_cf_id)}] = "{safe_component}"'
+        else:
+            field_clause = f'component = "{safe_component}"'
         jql = (
-            f'project = "{project_key}" AND component = "{safe_component}" '
+            f'project = "{project_key}" AND {field_clause} '
             f"AND statusCategory = Done AND resolved >= -{int(since_days)}d "
             f"ORDER BY resolved DESC"
         )
