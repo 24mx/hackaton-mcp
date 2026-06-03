@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mcp-hackaton": {
+      "type": "sse",
+      "url": "https://mcp-hackaton.fly.dev/sse"
+    },
+    "mcp-hackaton-local": {
+      "type": "sse",
+      "url": "http://0.0.0.0:8000/sse"
+    }
+  }
+}

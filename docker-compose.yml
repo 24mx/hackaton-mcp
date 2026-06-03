@@ -1,0 +1,18 @@
+services:
+  jira-mcp:
+    build: .
+    container_name: jira-mcp
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    # Dołącz do tej samej sieci co n8n — sprawdź nazwę przez: docker network ls
+    networks:
+      - n8n_network
+
+networks:
+  n8n_network:
+    external: true
+    # Wpisz tu dokładną nazwę sieci z: docker network ls | grep n8n
+    name: n8n_default
